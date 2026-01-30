@@ -103,7 +103,7 @@ class Daily_Salt_Rotation {
         }
 
         // Create table
-        require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+        require_once('/srv/wordpress/core/latest/wp-admin/includes/upgrade.php');
 
         $charset_collate = $wpdb->get_charset_collate();
 
@@ -245,10 +245,26 @@ class Daily_Salt_Rotation {
      * @return string|false Backup option name or false on failure
      */
     private static function backup_current_salts() {
-        $config_file = ABSPATH . 'wp-config.php';
+        // Try multiple possible wp-config.php locations (WPCloud specific)
+        $possible_paths = [
+            '/srv/htdocs/wp-config.php',           // Default location
+            '/srv/wp-config.php',                   // One level up
+            '/srv/htdocs/../wp-config.php',        // Relative parent
+            dirname(ABSPATH) . '/wp-config.php',   // WordPress parent directory
+            ABSPATH . 'wp-config.php',             // WordPress root (fallback)
+        ];
 
-        if (!file_exists($config_file) || !is_readable($config_file)) {
-            error_log('[Salt Rotation] Cannot read wp-config.php');
+        $config_file = null;
+        foreach ($possible_paths as $path) {
+            if (file_exists($path) && is_readable($path)) {
+                $config_file = $path;
+                error_log('[Salt Rotation] Found wp-config.php at: ' . $config_file);
+                break;
+            }
+        }
+
+        if (!$config_file) {
+            error_log('[Salt Rotation] Cannot find wp-config.php. Tried: ' . implode(', ', $possible_paths));
             return false;
         }
 
@@ -389,16 +405,15 @@ class Daily_Salt_Rotation {
             ];
         }
 
-        // Build command with proper escaping
-        $wp_path = escapeshellarg(ABSPATH);
-        $command = sprintf(
-            '%s config shuffle-salts --path=%s 2>&1',
-            escapeshellarg($wpcli),
-            $wp_path
-        );
+        // Build command - WPCloud may not support --path parameter
+        // Try without --path first since we're already in WordPress context
+        $command = sprintf('%s config shuffle-salts 2>&1', escapeshellarg($wpcli));
 
         // Execute command
         $output = shell_exec($command);
+
+        // If that fails with "unknown --path parameter" error, we're already done trying
+        // If it fails for other reasons, log it
 
         if ($output === null) {
             return [
