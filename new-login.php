@@ -4,7 +4,7 @@
  * Description: Allows direct auto-login to wp-admin from Convesio dashboard
  * Author: Team Convesio
  * Author URI: https://convesio.com
- * Version: 1.3
+ * Version: 1.4
  */
 
 function is_eligible_request() {
@@ -21,8 +21,8 @@ function is_eligible_request() {
 
 function init_convesio_login_server() {
     list($endpoint, $publicKey) = Convesio_Login_Server::parseUri(@$_SERVER['REQUEST_URI']);
-    
-    // Debugging (uncomment if needed)
+
+    // Debug log (uncomment to check)
     // error_log("Auto-login triggered | Endpoint: $endpoint | Key: $publicKey");
 
     if ($endpoint && $publicKey) {
@@ -30,7 +30,7 @@ function init_convesio_login_server() {
     }
 }
 
-// Hook early to catch the request
+// Hook early
 if (is_eligible_request()) {
     add_action('plugins_loaded', 'init_convesio_login_server', 0);
 }
@@ -47,21 +47,16 @@ class Convesio_Login_Server {
     }
 
     public static function login(WP_User $user) {
-        wp_set_auth_cookie($user->ID);
+        // Force correct cookie domain and HTTPS
+        $secure = is_ssl(); 
+        $domain = parse_url(site_url(), PHP_URL_HOST); 
+        $path = '/';
+
+        wp_set_auth_cookie($user->ID, true, $secure, $domain, $path);
+
         do_action('wp_login', $user->user_login, $user);
 
         $redirect_to = apply_filters('login_redirect', admin_url(), '', $user);
-
-        if (empty($redirect_to) || $redirect_to == 'wp-admin/' || $redirect_to == admin_url()) {
-            if (is_multisite() && ! get_active_blog_for_user($user->ID) && ! is_super_admin($user->ID)) {
-                $redirect_to = user_admin_url();
-            } elseif (is_multisite() && ! $user->has_cap('read')) {
-                $redirect_to = get_dashboard_url($user->ID);
-            } elseif (! $user->has_cap('edit_posts')) {
-                $redirect_to = $user->has_cap('read') ? admin_url('profile.php') : home_url();
-            }
-        }
-
         wp_safe_redirect($redirect_to);
         exit;
     }
