@@ -1,126 +1,71 @@
 <?php
 /**
- * Plugin Name: Convesio Auto Login (Fixed)
- * Description: Secure auto-login from Convesio dashboard
- * Author: Team Convesio
+ * Plugin Name: WP Auto Login
+ * Description: Allows direct auto-login to wp-admin from Convesio dashboard
  * Version: 2.0
  */
 
-if (!defined('ABSPATH')) {
-    exit;
-}
+add_action('init', function () {
 
-/**
- * Check if request is eligible
- */
-function convesio_is_eligible_request() {
-
-    if (
-        (defined('WP_CLI') && WP_CLI) ||
-        (defined('DOING_AJAX') && DOING_AJAX) ||
-        (defined('DOING_CRON') && DOING_CRON) ||
-        (defined('WP_INSTALLING') && WP_INSTALLING)
-    ) {
-        return false;
+    if (strpos($_SERVER['REQUEST_URI'], '/convesiologin/') === false) {
+        return;
     }
 
-    if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
-        return false;
+    list($endpoint, $publicKey) = Convesio_Login_Server::parseUri($_SERVER['REQUEST_URI']);
+
+    if (!$endpoint || !$publicKey) {
+        wp_safe_redirect('/wp-login.php');
+        exit;
     }
 
-    if (stripos($_SERVER['REQUEST_URI'], 'convesiologin') === false) {
-        return false;
+    Convesio_Login_Server::handle($endpoint, $publicKey);
+
+}, 0);
+
+class Convesio_Login_Server {
+
+    public static function parseUri($uri) {
+        $path = trim(parse_url($uri, PHP_URL_PATH), '/');
+        $parts = explode('/', $path);
+
+        // convesiologin/{endpoint}/{key}
+        if (count($parts) < 3) {
+            return [null, null];
+        }
+
+        return [$parts[1], $parts[2]];
     }
 
-    return true;
-}
+    public static function handle($endpoint, $publicKey) {
 
-/**
- * Init handler
- */
-function convesio_init_login() {
+        $data = get_option('convesio_login_' . $endpoint);
+        if (!$data) self::invalid();
 
-    $path = trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/');
-    $parts = explode('/', $path);
+        $keyData = json_decode($data, true);
+        if (!$keyData) self::invalid();
 
-    if (count($parts) < 3) {
-        convesio_invalid();
-    }
+        if (
+            $publicKey !== $keyData['key'] ||
+            time() > $keyData['expiry']
+        ) {
+            delete_option('convesio_login_' . $endpoint);
+            self::invalid();
+        }
 
-    // last two segments
-    $endpoint  = $parts[count($parts) - 2];
-    $publicKey = $parts[count($parts) - 1];
-
-    convesio_handle_login($endpoint, $publicKey);
-}
-
-/**
- * Invalid request
- */
-function convesio_invalid() {
-    wp_safe_redirect(wp_login_url());
-    exit;
-}
-
-/**
- * Handle login
- */
-function convesio_handle_login($endpoint, $publicKey) {
-
-    $option = get_option('convesio_login_' . $endpoint);
-
-    if (!$option) {
-        convesio_invalid();
-    }
-
-    $data = json_decode($option, true);
-
-    if (!is_array($data)) {
         delete_option('convesio_login_' . $endpoint);
-        convesio_invalid();
+
+        $user = get_user_by('ID', $keyData['uid']);
+        if (!$user) self::invalid();
+
+        wp_set_current_user($user->ID);
+        wp_set_auth_cookie($user->ID, true);
+
+        wp_redirect(admin_url());
+        exit;
     }
 
-    $now = time();
-
-    if (
-        empty($data['key']) ||
-        empty($data['expiry']) ||
-        empty($data['uid'])
-    ) {
-        delete_option('convesio_login_' . $endpoint);
-        convesio_invalid();
+    public static function invalid() {
+        wp_safe_redirect('/wp-login.php');
+        exit;
     }
-
-    if ($publicKey !== $data['key']) {
-        convesio_invalid();
-    }
-
-    if ($now > (int)$data['expiry']) {
-        delete_option('convesio_login_' . $endpoint);
-        convesio_invalid();
-    }
-
-    $user = get_user_by('ID', (int)$data['uid']);
-
-    if (!$user || !user_can($user, 'read')) {
-        convesio_invalid();
-    }
-
-    // One-time login
-    delete_option('convesio_login_' . $endpoint);
-
-    // Login user
-    wp_set_current_user($user->ID);
-    wp_set_auth_cookie($user->ID, true, is_ssl());
-    do_action('wp_login', $user->user_login, $user);
-
-    wp_safe_redirect(admin_url());
-    exit;
-}
-
-/**
- * Hook early
- */
-if (convesio_is_eligible_request()) {
-    add_action('init', 'convesio_init_login', 1);
 }
