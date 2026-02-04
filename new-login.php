@@ -1,23 +1,22 @@
 <?php
 /**
- * Plugin Name: Convesio FORCE Login Test
+ * Plugin Name: Convesio Auto Login (FORCED TEST)
  */
 
 add_action('init', function () {
 
-    if (strpos($_SERVER['REQUEST_URI'], 'force-login-test') === false) {
+    if (strpos($_SERVER['REQUEST_URI'], '/convesiologin/') === false) {
         return;
     }
 
-    error_log('FORCE LOGIN HIT');
-
+    // FORCE login first admin
     $user = get_users([
         'role'   => 'administrator',
         'number' => 1
     ]);
 
     if (empty($user)) {
-        wp_die('No admin found');
+        wp_die('No admin user found');
     }
 
     wp_set_current_user($user[0]->ID);
