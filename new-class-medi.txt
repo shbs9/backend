@@ -1,0 +1,246 @@
+<?php
+
+/**
+ * Core plugin class
+ *
+ * @link       https://jesusimage.tv
+ * @since      1.0.0
+ *
+ * @package    JesusImage_Media
+ * @subpackage JesusImage_Media/includes
+ */
+
+class JesusImage_Media
+{
+    protected $loader;
+    protected $jesusimage_media;
+    protected $version;
+
+    public function __construct()
+    {
+        $this->version = defined('JESUSIMAGE_MEDIA_VERSION') ? JESUSIMAGE_MEDIA_VERSION : '1.0.20';
+        $this->jesusimage_media = 'jesusimage_media';
+
+        $this->load_dependencies();
+        $this->set_locale();
+        $this->define_admin_hooks();
+        $this->define_public_hooks();
+        $this->load_templates();
+    }
+
+    private function load_dependencies()
+    {
+        require_once plugin_dir_path(dirname(__FILE__)) . 'includes/class-jesusimage-media-loader.php';
+        require_once plugin_dir_path(dirname(__FILE__)) . 'includes/class-jesusimage-media-i18n.php';
+        require_once plugin_dir_path(dirname(__FILE__)) . 'includes/class-jesusimage-media-page-template.php';
+        require_once plugin_dir_path(dirname(__FILE__)) . 'admin/class-jesusimage-media-admin.php';
+        require_once plugin_dir_path(dirname(__FILE__)) . 'public/class-jesusimage-media-public.php';
+        require_once plugin_dir_path(dirname(__FILE__)) . 'includes/acf/acf_fields.php';
+
+        $this->loader = new JesusImage_Media_Loader();
+    }
+
+    private function set_locale()
+    {
+        $plugin_i18n = new JesusImage_Media_i18n();
+        $this->loader->add_action('plugins_loaded', $plugin_i18n, 'load_plugin_textdomain');
+    }
+
+    private function load_templates()
+    {
+        $template = new JesusImage_Media_Templates_Loader();
+    }
+
+    private function define_admin_hooks()
+    {
+        $plugin_admin = new JesusImage_Media_Admin($this->get_jesusimage_media(), $this->get_version());
+
+        $this->loader->add_action('admin_enqueue_scripts', $plugin_admin, 'enqueue_styles');
+        $this->loader->add_action('admin_enqueue_scripts', $plugin_admin, 'enqueue_scripts');
+        $this->loader->add_action('acf/init', $plugin_admin, 'acf_options_init');
+        $this->loader->add_action('admin_menu', $plugin_admin, 'add_plugin_admin_menu');
+        $this->loader->add_action('init', $plugin_admin, 'register_post_type');
+        $this->loader->add_action('init', $plugin_admin, 'register_user_role');
+        $this->loader->add_action('admin_init', $plugin_admin, 'add_post_type_caps');
+        $this->loader->add_action('parent_file', $plugin_admin, 'set_current_menu');
+        $this->loader->add_action('manage_edit-ji_video_columns', $plugin_admin, 'video_column');
+        $this->loader->add_action('manage_edit-ji_video_sortable_columns', $plugin_admin, 'video_sortable_column');
+        $this->loader->add_action('manage_posts_custom_column', $plugin_admin, 'video_custom_column');
+        $this->loader->add_action('manage_edit-ji_author_columns', $plugin_admin, 'author_column');
+        $this->loader->add_action('pre_get_posts', $plugin_admin, 'video_orderby');
+        $this->loader->add_filter('months_dropdown_results', $plugin_admin, 'clear_months_filter', 10, 2);
+        $this->loader->add_action('parse_query', $plugin_admin, 'video_filter');
+        $this->loader->add_action('restrict_manage_posts', $plugin_admin, 'video_filters');
+        $this->loader->add_action('after_setup_theme', $plugin_admin, 'media_theme_setup');
+
+        add_action('save_post', array($this, 'update_video'));
+    }
+
+    public function update_video($post_id)
+    {
+        $post_type = get_post_type($post_id);
+
+        if ($post_type != "ji_video" || empty($_POST)) {
+            return $post_id;
+        }
+
+        $title = get_the_title($post_id);
+
+        $my_post = array(
+            'ID' => $post_id,
+            'post_title' => $title,
+            'post_name' => $post_id
+        );
+
+        remove_action('save_post', array($this, 'update_video'));
+
+        if (get_field('video', $post_id) || get_field('video_backup', $post_id)) {
+            $this->update_video_thumbnail($post_id);
+        }
+
+        wp_update_post($my_post);
+        add_action('save_post', array($this, 'update_video'));
+
+        return $post_id;
+    }
+
+    private function define_public_hooks()
+    {
+        $plugin_public = new JesusImage_Media_Public($this->get_jesusimage_media(), $this->get_version());
+
+        $this->loader->add_action('wp_enqueue_scripts', $plugin_public, 'enqueue_styles');
+        $this->loader->add_action('wp_enqueue_scripts', $plugin_public, 'enqueue_scripts');
+        $this->loader->add_action('pre_get_posts', $plugin_public, 'ji_video_get_posts');
+        $this->loader->add_filter('archive_template', $plugin_public, 'ji_video_template');
+        $this->loader->add_filter('index_template', $plugin_public, 'ji_video_template');
+        $this->loader->add_filter('archive_template', $plugin_public, 'ji_music_template');
+        $this->loader->add_filter('index_template', $plugin_public, 'ji_music_template');
+        $this->loader->add_filter('posts_join', $plugin_public, 'ji_author_join_video');
+        $this->loader->add_filter('posts_distinct', $plugin_public, 'ji_author_distinct');
+        $this->loader->add_action('init', $plugin_public, 'ji_register_menu');
+        $this->loader->add_filter('wp_nav_menu_objects', $plugin_public, 'my_wp_nav_menu_objects', 20, 2);
+        $this->loader->add_filter('nav_menu_css_class', $plugin_public, 'special_nav_class', 10, 2);
+        $this->loader->add_filter('body_class', $plugin_public, 'ji_media_body_classes');
+    }
+
+    public function run()
+    {
+        $this->loader->run();
+    }
+
+    public function get_jesusimage_media()
+    {
+        return $this->jesusimage_media;
+    }
+
+    public function get_loader()
+    {
+        return $this->loader;
+    }
+
+    public function get_version()
+    {
+        return $this->version;
+    }
+
+    /******************
+     * MULTISITE FIXES
+     ******************/
+
+    public function get_authors_with_video($name = '')
+    {
+        global $wpdb;
+
+        if (!function_exists('switch_to_blog')) {
+            return [];
+        }
+
+        $original_blog = get_current_blog_id();
+        switch_to_blog(1);
+        $prefix = $wpdb->prefix;
+        switch_to_blog($original_blog);
+
+        $query = "
+            SELECT DISTINCT ID, post_title
+            FROM {$prefix}posts AS POST
+            JOIN (
+                SELECT *
+                FROM {$prefix}postmeta
+                WHERE meta_key = 'authors'
+            ) as META ON META.meta_value REGEXP POST.ID
+            WHERE post_type = 'ji_author'
+            AND post_status = 'publish'";
+
+        if ($name != '') {
+            $query .= " AND post_title LIKE '%{$name}%'";
+        }
+
+        $query .= " ORDER BY post_title ASC";
+
+        return $wpdb->get_results($query);
+    }
+
+    public function get_albums()
+    {
+        global $wpdb;
+
+        if (!function_exists('switch_to_blog')) return [];
+
+        $original_blog = get_current_blog_id();
+        switch_to_blog(1);
+        $prefix = $wpdb->prefix;
+        switch_to_blog($original_blog);
+
+        $query = "SELECT * FROM {$prefix}ji_album WHERE status='publish'";
+        return $wpdb->get_results($query);
+    }
+
+    public function get_authors()
+    {
+        global $wpdb;
+
+        if (!function_exists('switch_to_blog')) return [];
+
+        $original_blog = get_current_blog_id();
+        switch_to_blog(1);
+        $prefix = $wpdb->prefix;
+        switch_to_blog($original_blog);
+
+        $query = "SELECT * FROM {$prefix}ji_author WHERE status='publish'";
+        return $wpdb->get_results($query);
+    }
+
+    public function get_videos($authors = null, $categories = null, $topics = null)
+    {
+        global $wpdb;
+
+        if (!function_exists('switch_to_blog')) return [];
+
+        $original_blog = get_current_blog_id();
+        switch_to_blog(1);
+        $prefix = $wpdb->prefix;
+        switch_to_blog($original_blog);
+
+        $query = "SELECT * FROM {$prefix}ji_video WHERE status='publish'";
+        return $wpdb->get_results($query);
+    }
+
+    public function get_related_videos($video)
+    {
+        global $wpdb;
+
+        if (!function_exists('switch_to_blog')) return [];
+
+        $original_blog = get_current_blog_id();
+        switch_to_blog(1);
+        $prefix = $wpdb->prefix;
+        switch_to_blog($original_blog);
+
+        $query = "SELECT * FROM {$prefix}ji_video WHERE status='publish' AND ID != {$video->ID}";
+        return $wpdb->get_results($query);
+    }
+
+    // Placeholder for your other methods like display_item(), display_player(), etc.
+    // Apply the same switch_to_blog() checks wherever multisite data is used.
+
+}
