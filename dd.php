@@ -1,270 +1,336 @@
 <?php
 /**
  * Plugin Name: Daily Salt Rotation (MU)
- * Description: Rotates WordPress salts daily for compliance with backup and audit logging
- * Version: 1.1.0
+ * Description: Rotates WordPress salts daily for compliance with logging and backups.
+ * Version: 1.1.1
  */
 
-if (!defined('ABSPATH')) exit;
+if (!defined('ABSPATH')) {
+    exit;
+}
 
 class Daily_Salt_Rotation {
 
-const CRON_HOOK='daily_salt_rotation_event';
-const LOG_TABLE_SUFFIX='salt_rotation_log';
-const BACKUP_OPTION_PREFIX='salt_rotation_backup_';
-const BACKUPS_TO_KEEP=5;
+    const CRON_HOOK = 'daily_salt_rotation_event';
+    const LOG_TABLE_SUFFIX = 'salt_rotation_log';
+    const BACKUP_OPTION_PREFIX = 'salt_rotation_backup_';
+    const BACKUPS_TO_KEEP = 5;
+
+    const SALT_KEYS = [
+        'AUTH_KEY',
+        'SECURE_AUTH_KEY',
+        'LOGGED_IN_KEY',
+        'NONCE_KEY',
+        'AUTH_SALT',
+        'SECURE_AUTH_SALT',
+        'LOGGED_IN_SALT',
+        'NONCE_SALT'
+    ];
 
-const SALT_KEYS=[
-'AUTH_KEY','SECURE_AUTH_KEY','LOGGED_IN_KEY','NONCE_KEY',
-'AUTH_SALT','SECURE_AUTH_SALT','LOGGED_IN_SALT','NONCE_SALT'
-];
+    public static function init() {
+
+        add_action('plugins_loaded', [__CLASS__, 'create_log_table_if_needed']);
+        add_action('plugins_loaded', [__CLASS__, 'schedule_rotation']);
+
+        add_action(self::CRON_HOOK, [__CLASS__, 'execute_rotation']);
+
+        add_action('init', [__CLASS__, 'check_if_overdue']);
+    }
+
+    /**
+     * Create log table
+     */
+    public static function create_log_table_if_needed() {
 
-public static function init(){
+        global $wpdb;
 
-add_action('plugins_loaded',[__CLASS__,'create_log_table_if_needed']);
-add_action('plugins_loaded',[__CLASS__,'schedule_rotation']);
+        $table = $wpdb->prefix . self::LOG_TABLE_SUFFIX;
 
-add_action(self::CRON_HOOK,[__CLASS__,'execute_rotation']);
+        if ($wpdb->get_var("SHOW TABLES LIKE '$table'") == $table) {
+            return;
+        }
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
-add_action('init',[__CLASS__,'check_if_overdue']);
+        $charset = $wpdb->get_charset_collate();
 
-}
+        $sql = "CREATE TABLE $table (
+            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            rotation_date DATETIME NOT NULL,
+            status ENUM('success','failure') NOT NULL,
+            wpcli_output TEXT,
+            error_message TEXT,
+            backup_option_id VARCHAR(100),
+            execution_time FLOAT,
+            triggered_by VARCHAR(50),
+            INDEX(rotation_date),
+            INDEX(status)
+        ) $charset;";
+
+        dbDelta($sql);
+    }
+
+    /**
+     * Schedule cron
+     */
+    public static function schedule_rotation() {
+
+        if (wp_next_scheduled(self::CRON_HOOK)) {
+            return;
+        }
+
+        $timestamp = strtotime('tomorrow midnight');
+
+        wp_schedule_event($timestamp, 'daily', self::CRON_HOOK);
+    }
 
-public static function create_log_table_if_needed(){
+    /**
+     * Cron fallback
+     */
+    public static function check_if_overdue() {
 
-global $wpdb;
+        if (!wp_doing_cron()) {
+            return;
+        }
 
-$table=$wpdb->prefix.self::LOG_TABLE_SUFFIX;
+        global $wpdb;
 
-if($wpdb->get_var("SHOW TABLES LIKE '$table'")==$table) return;
+        $table = $wpdb->prefix . self::LOG_TABLE_SUFFIX;
 
-require_once ABSPATH.'wp-admin/includes/upgrade.php';
+        $last = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT rotation_date FROM $table WHERE status=%s ORDER BY rotation_date DESC LIMIT 1",
+                'success'
+            )
+        );
 
-$charset=$wpdb->get_charset_collate();
+        if (!$last || strtotime($last) < strtotime('-25 hours')) {
+            self::execute_rotation('overdue-fallback');
+        }
+    }
 
-$sql="CREATE TABLE $table(
-id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-rotation_date DATETIME NOT NULL,
-status ENUM('success','failure') NOT NULL,
-wpcli_output TEXT,
-error_message TEXT,
-backup_option_id VARCHAR(100),
-execution_time FLOAT,
-triggered_by VARCHAR(50),
-INDEX(rotation_date),
-INDEX(status)
-) $charset;";
+    /**
+     * Execute rotation
+     */
+    public static function execute_rotation($trigger = 'wp-cron') {
 
-dbDelta($sql);
+        if (defined('SALT_ROTATION_DISABLED') && SALT_ROTATION_DISABLED) {
+            return;
+        }
 
-}
+        $start = microtime(true);
 
-public static function schedule_rotation(){
+        $backup = self::backup_current_salts();
 
-if(wp_next_scheduled(self::CRON_HOOK)) return;
+        if (!$backup) {
 
-$timestamp=strtotime('tomorrow midnight');
+            self::log_rotation_event(
+                'failure',
+                '',
+                'Failed to backup salts',
+                null,
+                0,
+                $trigger
+            );
 
-wp_schedule_event($timestamp,'daily',self::CRON_HOOK);
+            return;
+        }
 
-}
+        $result = self::execute_wpcli_command();
 
-public static function check_if_overdue(){
+        $time = microtime(true) - $start;
 
-if(!wp_doing_cron()) return;
+        if ($result['success']) {
 
-global $wpdb;
+            self::log_rotation_event(
+                'success',
+                $result['output'],
+                '',
+                $backup,
+                $time,
+                $trigger
+            );
 
-$table=$wpdb->prefix.self::LOG_TABLE_SUFFIX;
+            self::cleanup_old_backups();
 
-$last=$wpdb->get_var(
-$wpdb->prepare("SELECT rotation_date FROM $table WHERE status=%s ORDER BY rotation_date DESC LIMIT 1",'success')
-);
+        } else {
 
-if(!$last || strtotime($last)<strtotime('-25 hours')){
-self::execute_rotation('overdue-fallback');
-}
+            self::log_rotation_event(
+                'failure',
+                $result['output'],
+                $result['error'],
+                $backup,
+                $time,
+                $trigger
+            );
+        }
+    }
 
-}
+    /**
+     * Backup salts
+     */
+    private static function backup_current_salts() {
 
-public static function execute_rotation($trigger='wp-cron'){
+        $config = dirname(ABSPATH) . '/wp-config.php';
 
-if(defined('SALT_ROTATION_DISABLED') && SALT_ROTATION_DISABLED) return;
+        if (!file_exists($config)) {
+            return false;
+        }
 
-$start=microtime(true);
+        $content = file_get_contents($config);
 
-$backup=self::backup_current_salts();
+        $backup = [];
 
-if(!$backup){
+        foreach (self::SALT_KEYS as $key) {
 
-self::log_rotation_event('failure','','Backup failed',null,0,$trigger);
+            $pattern = '/define\s*\(\s*[\'"]' . preg_quote($key, '/') . '[\'"]\s*,\s*[\'"](.+?)[\'"]\s*\)/';
 
-return;
+            if (preg_match($pattern, $content, $m)) {
+                $backup[$key] = $m[1];
+            }
+        }
 
-}
+        if (count($backup) < 8) {
+            return false;
+        }
 
-$result=self::execute_wpcli_command();
+        $timestamp = current_time('timestamp');
 
-$time=microtime(true)-$start;
+        $name = self::BACKUP_OPTION_PREFIX . $timestamp;
 
-if($result['success']){
+        add_option($name, [
+            'salts' => $backup,
+            'timestamp' => $timestamp,
+            'date' => current_time('mysql')
+        ], '', 'no');
 
-self::log_rotation_event('success',$result['output'],'',$backup,$time,$trigger);
+        return $name;
+    }
 
-self::cleanup_old_backups();
+    /**
+     * Cleanup backups
+     */
+    private static function cleanup_old_backups() {
 
-}else{
+        global $wpdb;
 
-self::log_rotation_event('failure',$result['output'],$result['error'],$backup,$time,$trigger);
+        $keep = defined('SALT_ROTATION_BACKUP_KEEP')
+            ? SALT_ROTATION_BACKUP_KEEP
+            : self::BACKUPS_TO_KEEP;
 
-}
+        $options = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT option_name FROM $wpdb->options
+                 WHERE option_name LIKE %s
+                 ORDER BY option_name DESC",
+                $wpdb->esc_like(self::BACKUP_OPTION_PREFIX) . '%'
+            )
+        );
 
-}
+        if (count($options) > $keep) {
 
-private static function backup_current_salts(){
+            $delete = array_slice($options, $keep);
 
-$config=dirname(ABSPATH).'/wp-config.php';
+            foreach ($delete as $opt) {
+                delete_option($opt);
+            }
+        }
+    }
 
-if(!file_exists($config)) return false;
+    /**
+     * Find WP CLI
+     */
+    private static function get_wpcli_path() {
 
-$content=file_get_contents($config);
+        $paths = [
+            '/usr/local/bin/wp-cli',
+            '/usr/local/bin/wp',
+            '/usr/bin/wp'
+        ];
 
-$backup=[];
+        foreach ($paths as $p) {
 
-foreach(self::SALT_KEYS as $key){
+            if (file_exists($p) && is_executable($p)) {
+                return $p;
+            }
+        }
 
-if(preg_match("/define\s*\(\s*['\"]$key['\"]\s*,\s*['\"](.+?)['\"]\s*\)/",$content,$m))
-$backup[$key]=$m[1];
+        return false;
+    }
 
-}
+    /**
+     * Execute CLI command
+     */
+    private static function execute_wpcli_command() {
 
-if(count($backup)<8) return false;
+        if (!function_exists('shell_exec')) {
 
-$timestamp=current_time('timestamp');
+            return [
+                'success' => false,
+                'output' => '',
+                'error' => 'shell_exec disabled'
+            ];
+        }
 
-$name=self::BACKUP_OPTION_PREFIX.$timestamp;
+        $wpcli = self::get_wpcli_path();
 
-add_option($name,[
-'salts'=>$backup,
-'timestamp'=>$timestamp,
-'date'=>current_time('mysql')
-],'','no');
+        if (!$wpcli) {
 
-return $name;
+            return [
+                'success' => false,
+                'output' => '',
+                'error' => 'WP CLI not found'
+            ];
+        }
 
-}
+        $php = PHP_BINARY;
 
-private static function cleanup_old_backups(){
+        $cmd = sprintf(
+            '%s %s config shuffle-salts --path=%s 2>&1',
+            escapeshellcmd($php),
+            escapeshellcmd($wpcli),
+            escapeshellarg(ABSPATH)
+        );
 
-global $wpdb;
+        $output = shell_exec($cmd);
 
-$keep=defined('SALT_ROTATION_BACKUP_KEEP') ? SALT_ROTATION_BACKUP_KEEP : self::BACKUPS_TO_KEEP;
+        if ($output === null) {
 
-$options=$wpdb->get_col(
-$wpdb->prepare("SELECT option_name FROM $wpdb->options WHERE option_name LIKE %s ORDER BY option_name DESC",
-$wpdb->esc_like(self::BACKUP_OPTION_PREFIX).'%')
-);
+            return [
+                'success' => false,
+                'output' => '',
+                'error' => 'command failed'
+            ];
+        }
 
-if(count($options)>$keep){
+        $success = stripos($output, 'Success') !== false;
 
-$delete=array_slice($options,$keep);
+        return [
+            'success' => $success,
+            'output' => trim($output),
+            'error' => $success ? '' : 'WP CLI failure'
+        ];
+    }
 
-foreach($delete as $opt) delete_option($opt);
+    /**
+     * Log rotation
+     */
+    private static function log_rotation_event($status, $output, $error, $backup, $time, $trigger) {
 
-}
+        global $wpdb;
 
-}
+        $table = $wpdb->prefix . self::LOG_TABLE_SUFFIX;
 
-private static function get_wpcli_path(){
-
-$paths=[
-'/usr/local/bin/wp-cli',
-'/usr/local/bin/wp',
-'/usr/bin/wp'
-];
-
-foreach($paths as $p){
-
-if(file_exists($p) && is_executable($p)) return $p;
-
-}
-
-return false;
-
-}
-
-private static function execute_wpcli_command(){
-
-if(!function_exists('shell_exec')){
-
-return[
-'success'=>false,
-'output'=>'',
-'error'=>'shell_exec disabled'
-];
-
-}
-
-$wpcli=self::get_wpcli_path();
-
-if(!$wpcli){
-
-return[
-'success'=>false,
-'output'=>'',
-'error'=>'WP CLI not found'
-];
-
-}
-
-$php=PHP_BINARY;
-
-$cmd=sprintf(
-'%s %s config shuffle-salts --path=%s 2>&1',
-escapeshellcmd($php),
-escapeshellcmd($wpcli),
-escapeshellarg(ABSPATH)
-);
-
-$output=shell_exec($cmd);
-
-if($output===null){
-
-return[
-'success'=>false,
-'output'=>'',
-'error'=>'command failed'
-];
-
-}
-
-$success=stripos($output,'Success')!==false;
-
-return[
-'success'=>$success,
-'output'=>trim($output),
-'error'=>$success?'':'WP CLI failure'
-];
-
-}
-
-private static function log_rotation_event($status,$output,$error,$backup,$time,$trigger){
-
-global $wpdb;
-
-$table=$wpdb->prefix.self::LOG_TABLE_SUFFIX;
-
-$wpdb->insert($table,[
-'rotation_date'=>current_time('mysql'),
-'status'=>$status,
-'wpcli_output'=>$output,
-'error_message'=>$error,
-'backup_option_id'=>$backup,
-'execution_time'=>$time,
-'triggered_by'=>$trigger
-]);
-
-}
+        $wpdb->insert($table, [
+            'rotation_date' => current_time('mysql'),
+            'status' => $status,
+            'wpcli_output' => $output,
+            'error_message' => $error,
+            'backup_option_id' => $backup,
+            'execution_time' => $time,
+            'triggered_by' => $trigger
+        ]);
+    }
 
 }
 
