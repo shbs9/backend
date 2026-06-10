@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: Strip Edge Tracking Cookies
- * Description: Overwrites _sbp/_fbp with expired Set-Cookie headers so CDN stops seeing them.
+ * Description: Removes Vary:Cookie and kills _sbp/_fbp so Atomic CDN can cache.
  */
 
 defined( 'ABSPATH' ) || exit;
@@ -11,11 +11,15 @@ add_action( 'send_headers', 'stcc_kill_tracking_cookies', PHP_INT_MAX );
 function stcc_kill_tracking_cookies() {
     if ( is_user_logged_in() || is_admin() ) return;
     if ( defined('REST_REQUEST') && REST_REQUEST ) return;
-    if ( $_SERVER['REQUEST_METHOD'] === 'POST' ) return;
+    if ( ( $_SERVER['REQUEST_METHOD'] ?? 'GET' ) === 'POST' ) return;
 
     $host = $_SERVER['HTTP_HOST'] ?? '';
 
-    // Overwrite with expired cookies — forces browser + CDN to drop them
+    // 1. Remove Vary: Cookie — this alone prevents CDN caching
+    header_remove( 'Vary' );
+    header( 'Vary: Accept-Encoding', true ); // keep only encoding vary
+
+    // 2. Expire the tracking cookies so browser stops sending them
     $cookies = [
         [ 'name' => '_sbp', 'domain' => '.' . $host ],
         [ 'name' => '_fbp', 'domain' => 'express.conves.io' ],
@@ -28,10 +32,13 @@ function stcc_kill_tracking_cookies() {
                 $c['name'],
                 $c['domain']
             ),
-            false // false = don't replace existing Set-Cookie headers, ADD this one
+            false
         );
     }
 
-    // Tell CDN to cache publicly
+    // 3. Tell CDN to cache publicly
     header( 'Cache-Control: public, max-age=3600, s-maxage=3600', true );
+
+    // 4. Remove the WordPress "never cache" expires header
+    header_remove( 'Expires' );
 }
